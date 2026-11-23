@@ -15,6 +15,7 @@ from alerta.models.key import ApiKey
 from alerta.models.permission import Permission
 from alerta.models.token import Jwt
 from alerta.models.user import User
+from alerta.utils.audit import auth_audit_trail
 
 if TYPE_CHECKING:
     from typing import List  # noqa
@@ -43,6 +44,9 @@ def permission(scope=None):
             if key:
                 key_info = ApiKey.verify_key(key)
                 if not key_info:
+                    auth_audit_trail.send(current_app._get_current_object(), event='api-key-invalid',
+                                          message='API request without valid API key', user=None, customers=[], scopes=[],
+                                          resource_id=key, type='apikey', request=request)
                     raise ApiError(f"API key parameter '{key}' is invalid", 401)
                 g.user_id = None
                 g.login = key_info.user
@@ -50,6 +54,9 @@ def permission(scope=None):
                 g.scopes = key_info.scopes  # type: List[Scope]
 
                 if not Permission.is_in_scope(scope, have_scopes=g.scopes):
+                    auth_audit_trail.send(current_app._get_current_object(), event='api-key-scope-violation',
+                                          message='API request outside of scope', user=g.login, customers=g.customers, scopes=g.scopes,
+                                          resource_id=key, type='apikey', request=request)
                     raise ApiError(f'Missing required scope: {scope}', 403)
                 else:
                     return f(*args, **kwargs)
@@ -59,6 +66,9 @@ def permission(scope=None):
                 try:
                     receiver = HmacAuth.authenticate(request)
                 except mohawk.exc.HawkFail as e:
+                    auth_audit_trail.send(current_app._get_current_object(), event='hawk-fail',
+                                          message='API request with invalid Hawk HMAC', user=None, customers=[], scopes=[],
+                                          resource_id=auth_header, type='auth', request=request, exception=e)
                     raise ApiError(str(e), 401)
 
                 g.user_id = None
@@ -75,10 +85,19 @@ def permission(scope=None):
                 try:
                     jwt = Jwt.parse(token)
                 except DecodeError:
+                    auth_audit_trail.send(current_app._get_current_object(), event='bearer-invalid-audience',
+                                          message='API request with invalid bearer token', user=None, customers=[], scopes=[],
+                                          resource_id=token, type='bearer-token', request=request)
                     raise ApiError('Token is invalid', 401)
                 except ExpiredSignatureError:
+                    auth_audit_trail.send(current_app._get_current_object(), event='bearer-expired',
+                                          message='API request with expired bearer token', user=None, customers=[], scopes=[],
+                                          resource_id=token, type='bearer-token', request=request)
                     raise ApiError('Token has expired', 401)
                 except InvalidAudienceError:
+                    auth_audit_trail.send(current_app._get_current_object(), event='bearer-invalid-audience',
+                                          message='API request with bearer token has invalid audience', user=None, customers=[], scopes=[],
+                                          resource_id=token, type='bearer-token', request=request)
                     raise ApiError('Invalid audience', 401)
                 g.user_id = jwt.oid or jwt.subject
                 g.login = jwt.preferred_username
@@ -86,6 +105,9 @@ def permission(scope=None):
                 g.scopes = jwt.scopes  # type: List[Scope]
 
                 if not Permission.is_in_scope(scope, have_scopes=g.scopes):
+                    auth_audit_trail.send(current_app._get_current_object(), event='bearer-scope-violation',
+                                          message='API request outside of scope', user=g.login, customers=g.customers, scopes=g.scopes,
+                                          resource_id=token, type='bearer-token', request=request)
                     raise ApiError(f'Missing required scope: {scope}', 403)
                 else:
                     return f(*args, **kwargs)
@@ -107,8 +129,14 @@ def permission(scope=None):
                             user = User(name=username, login=username, password='', email='', roles=roles, text='Proxy user')
                             user = user.create()
                         except Exception as e:
+                            auth_audit_trail.send(current_app._get_current_object(), event='auth-proxy-user-creation-failure',
+                                                  message='API request with new AuthProxy user failed', user=g.login, customers=g.customers, scopes=g.scopes,
+                                                  resource_id=username, type='username', request=request, error=str(e))
                             ApiError(str(e), 500)
                     else:
+                        auth_audit_trail.send(current_app._get_current_object(), event='auth-proxy-user-creation-denied',
+                                              message='API request with new AuthProxy user denied', user=g.login, customers=g.customers, scopes=g.scopes,
+                                              resource_id=username, type='username', request=request)
                         raise ApiError('user auto-signup is disabled', 403)
 
                 g.user_id = user.id
@@ -117,6 +145,9 @@ def permission(scope=None):
                 g.scopes = Permission.lookup(user.login, roles=roles)  # type: List[Scope]
 
                 if not Permission.is_in_scope(scope, have_scopes=g.scopes):
+                    auth_audit_trail.send(current_app._get_current_object(), event='auth-proxy-scope-violation',
+                                          message='API request outside of scope', user=g.login, customers=g.customers, scopes=g.scopes,
+                                          resource_id=username, type='username', request=request)
                     raise BasicAuthError(f'Missing required scope: {scope}', 403)
                 else:
                     return f(*args, **kwargs)
@@ -126,19 +157,33 @@ def permission(scope=None):
             credentials = m.group(1) if m else None
 
             if credentials:
+                decoded_credentials = None
                 try:
-                    username, password = base64.b64decode(credentials).decode('utf-8').split(':')
+                    decoded_credentials = base64.b64decode(credentials).decode('utf-8')
+                    username, password = decoded_credentials.split(':', maxsplit=1)
                 except Exception as e:
+                    auth_audit_trail.send(current_app._get_current_object(), event='basic-auth-decode-failure',
+                                          message='API request with invalid basic authentication', user=g.login, customers=g.customers, scopes=g.scopes,
+                                          resource_id=decoded_credentials or credentials, type='credentials', request=request)
                     raise BasicAuthError('Invalid credentials', 400, errors=[str(e)])
 
                 user = User.check_credentials(username, password)
                 if not user:
+                    auth_audit_trail.send(current_app._get_current_object(), event='basic-auth-failure',
+                                          message='API request with invalid credentials', user=g.login, customers=g.customers, scopes=g.scopes,
+                                          resource_id=decoded_credentials, type='credentials', request=request)
                     raise BasicAuthError('Authorization required', 401)
 
                 if current_app.config['EMAIL_VERIFICATION'] and not user.email_verified:
+                    auth_audit_trail.send(current_app._get_current_object(), event='basic-auth-email-not-verified',
+                                          message='API request with unverified email', user=g.login, customers=g.customers, scopes=g.scopes,
+                                          resource_id=decoded_credentials, type='credentials', request=request)
                     raise BasicAuthError('email not verified', 401)
 
                 if not_authorized('ALLOWED_EMAIL_DOMAINS', groups=[user.domain]):
+                    auth_audit_trail.send(current_app._get_current_object(), event='basic-auth-email-unauthorized-domain',
+                                          message='API request with email on unauthorized domain', user=g.login, customers=g.customers, scopes=g.scopes,
+                                          resource_id=decoded_credentials, type='credentials', request=request)
                     raise BasicAuthError('Unauthorized domain', 403)
 
                 g.user_id = user.id
@@ -147,6 +192,9 @@ def permission(scope=None):
                 g.scopes = Permission.lookup(user.email, roles=user.roles)  # type: List[Scope]
 
                 if not Permission.is_in_scope(scope, have_scopes=g.scopes):
+                    auth_audit_trail.send(current_app._get_current_object(), event='basic-auth-scope-violation',
+                                          message='API request outside of scope', user=g.login, customers=g.customers, scopes=g.scopes,
+                                          resource_id=decoded_credentials, type='credentials', request=request)
                     raise BasicAuthError(f'Missing required scope: {scope}', 403)
                 else:
                     return f(*args, **kwargs)
@@ -170,6 +218,10 @@ def permission(scope=None):
             # Google App Engine Cron Service
             if request.headers.get('X-Appengine-Cron', False) and request.headers.get('X-Forwarded-For', '') == '0.1.0.1':
                 return f(*args, **kwargs)
+
+            auth_audit_trail.send(current_app._get_current_object(), event='missing-authorization',
+                                  message='API request is missing authorization', user=g.login, customers=g.customers, scopes=g.scopes,
+                                  resource_id='', type='', request=request)
 
             raise ApiError('Missing authorization API Key or Bearer Token', 401)
 

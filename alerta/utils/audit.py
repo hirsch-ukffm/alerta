@@ -85,6 +85,12 @@ class AuditTrail:
             if data and app.config['AUDIT_LOG_REDACT']:
                 if 'password' in data:
                     data['password'] = '[REDACTED]'
+                if type == 'credentials':
+                    username = resource_id.split(':', maxsplit=1)[0]
+                    if username == resource_id:
+                        resource_id = '[REDACTED]'
+                    else:
+                        resource_id = username + ':[REDACTED]'
             if app.config['AUDIT_LOG_JSON']:
                 return data
             return json.dumps(data)
