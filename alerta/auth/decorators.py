@@ -27,9 +27,10 @@ def permission(scope=None):
         @wraps(f)
         def wrapped(*args, **kwargs):
 
+            auth_header = request.headers.get('Authorization', '')
+
             # API Key (Authorization: Key <key>)
-            if 'Authorization' in request.headers and request.headers['Authorization'].startswith('Key '):
-                auth_header = request.headers['Authorization']
+            if 'Authorization' in request.headers and auth_header.startswith('Key '):
                 m = re.match(r'Key (\S+)', auth_header)
                 key = m.group(1) if m else None
             # API Key (X-API-Key: <key>)
@@ -54,7 +55,7 @@ def permission(scope=None):
                     return f(*args, **kwargs)
 
             # Hawk HMAC Signature (Authorization: Hawk mac=...)
-            if request.headers.get('Authorization', '').startswith('Hawk'):
+            if auth_header.startswith('Hawk'):
                 try:
                     receiver = HmacAuth.authenticate(request)
                 except mohawk.exc.HawkFail as e:
@@ -67,7 +68,6 @@ def permission(scope=None):
                 return f(*args, **kwargs)
 
             # Bearer Token
-            auth_header = request.headers.get('Authorization', '')
             m = re.match(r'Bearer (\S+)', auth_header)
             token = m.group(1) if m else None
 
@@ -122,7 +122,6 @@ def permission(scope=None):
                     return f(*args, **kwargs)
 
             # Basic Auth
-            auth_header = request.headers.get('Authorization', '')
             m = re.match(r'Basic (\S+)', auth_header)
             credentials = m.group(1) if m else None
 
